@@ -9736,13 +9736,25 @@ def _run_prompt_submit(
                     from agent.title_generator import maybe_auto_title
 
                     _title_key = session.get("session_key") or sid
+                    # Snapshot routing now, then open/close the owning profile
+                    # database inside the daemon worker. Entering _session_db
+                    # around maybe_auto_title() would close a named-profile
+                    # handle before the asynchronous worker used it.
+                    _title_db_session = {
+                        "session_key": _title_key,
+                        "profile_home": session.get("profile_home"),
+                    }
+
+                    def _title_db_context():
+                        return _session_db(_title_db_session)
+
                     # Snapshot the runtime identity; the validator lets the
                     # background titler skip its LLM call if the session's
                     # model changed before it fires (#19027).
                     _title_model = getattr(agent, "model", None)
                     _title_provider = getattr(agent, "provider", None)
                     maybe_auto_title(
-                        _get_db(),
+                        None,
                         _title_key,
                         text,
                         raw,
@@ -9758,6 +9770,7 @@ def _run_prompt_submit(
                             "api_key": getattr(agent, "api_key", None),
                             "api_mode": getattr(agent, "api_mode", None),
                         },
+                        session_db_context_factory=_title_db_context,
                         runtime_validator=lambda: (
                             getattr(agent, "model", None) == _title_model
                             and getattr(agent, "provider", None) == _title_provider

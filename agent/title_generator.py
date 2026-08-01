@@ -4,6 +4,7 @@ Runs asynchronously after the first response is delivered so it never
 adds latency to the user-facing reply.
 """
 
+from contextlib import AbstractContextManager, nullcontext
 import logging
 import threading
 from typing import Callable, Optional
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 # become visible instead of piling up as NULL session titles.
 FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
+SessionDBContextFactory = Callable[[], AbstractContextManager]
 
 # Validation callback: () -> bool. Called right before the LLM request in
 # generate_title(). Return False to skip — e.g. the user switched models
@@ -242,12 +244,13 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    session_db_context_factory: Optional[SessionDBContextFactory] = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
     Called in a background thread after the first exchange completes.
     Silently skips if:
-    - session_db is None
+    - both session_db and session_db_context_factory are None
     - session already has a title (user-set or previously auto-generated)
     - title generation fails
     - runtime_validator returns False (model was switched)
@@ -262,16 +265,22 @@ def auto_title_session(
     process restarts.
     """
     try:
-        _auto_title_session(
-            session_db,
-            session_id,
-            user_message,
-            assistant_response,
-            failure_callback=failure_callback,
-            main_runtime=main_runtime,
-            title_callback=title_callback,
-            runtime_validator=runtime_validator,
+        db_context = (
+            session_db_context_factory()
+            if session_db_context_factory is not None
+            else nullcontext(session_db)
         )
+        with db_context as worker_db:
+            _auto_title_session(
+                worker_db,
+                session_id,
+                user_message,
+                assistant_response,
+                failure_callback=failure_callback,
+                main_runtime=main_runtime,
+                title_callback=title_callback,
+                runtime_validator=runtime_validator,
+            )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
         # names the likely cause so "restart the process" is discoverable.
@@ -363,14 +372,23 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    session_db_context_factory: Optional[SessionDBContextFactory] = None,
 ) -> None:
     """Fire-and-forget title generation after the first exchange.
 
     Only generates a title when:
     - This appears to be the first user→assistant exchange
     - No title is already set
+
+    ``session_db`` is a borrowed handle. Callers that need a dedicated handle
+    can pass ``session_db_context_factory`` so it lives inside the worker.
     """
-    if not session_db or not session_id or not user_message or not assistant_response:
+    if (
+        (session_db is None and session_db_context_factory is None)
+        or not session_id
+        or not user_message
+        or not assistant_response
+    ):
         return
 
     # Count user messages in history to detect first exchange.
@@ -387,15 +405,19 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
+    worker_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+        "runtime_validator": runtime_validator,
+    }
+    if session_db_context_factory is not None:
+        worker_kwargs["session_db_context_factory"] = session_db_context_factory
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-            "runtime_validator": runtime_validator,
-        },
+        kwargs=worker_kwargs,
         daemon=True,
         name="auto-title",
     )
