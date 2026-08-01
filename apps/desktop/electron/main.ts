@@ -29,6 +29,7 @@ import {
   shell,
   systemPreferences
 } from 'electron'
+import type { ClientRequest } from 'electron'
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
@@ -77,6 +78,11 @@ import {
   tokenPreview
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
+import {
+  installMainProcessNetworkErrorGuard,
+  isTransientChromiumNetError,
+  withTransientNetworkRetry
+} from './network-errors'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
@@ -1045,10 +1051,46 @@ function registerMediaProtocol() {
     // Delegate to Electron's net stack on a file:// URL — it resolves the
     // content-type and honors Range requests so seeking works. Forward the
     // renderer's headers (notably Range) and skip custom-protocol re-entry.
-    return electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
-      bypassCustomProtocolHandlers: true,
-      headers: request.headers
-    })
+    //
+    // electronNet.fetch can reject with net::ERR_NETWORK_CHANGED /
+    // ERR_NETWORK_IO_SUSPENDED when the OS network stack is mid-transition.
+    // Without a catch (and without the main-process guard below) that
+    // rejection escapes the protocol handler as an uncaught SimpleURLLoader
+    // exception and Electron bricks the app with a modal dialog (#56835).
+    try {
+      return await withTransientNetworkRetry(
+        () =>
+          electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
+            bypassCustomProtocolHandlers: true,
+            headers: request.headers
+          }),
+        {
+          retries: 2,
+          delayMs: 250,
+          onRetry: (error, attempt) => {
+            rememberLog(
+              `[media] retrying stream after network transition (attempt ${attempt}): ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            )
+          }
+        }
+      )
+    } catch (error) {
+      if (isTransientChromiumNetError(error)) {
+        rememberLog(
+          `[media] suppressing network-transition error on stream: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+
+        return new Response('Network temporarily unavailable', { status: 503 })
+      }
+
+      rememberLog(`[media] fetch failed: ${error instanceof Error ? error.message : String(error)}`)
+
+      return new Response('Media unavailable', { status: 500 })
+    }
   })
 }
 
@@ -1288,6 +1330,32 @@ function rememberLog(chunk) {
 }
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+
+// Last-line defense for Chromium net transitions that escape local handlers.
+// Install after crash forensics so every genuine main-process fault is still
+// recorded and flushed before the guard restores Electron's fatal dialog.
+installMainProcessNetworkErrorGuard({
+  onTransient: (error, source) => {
+    rememberLog(
+      `[net] suppressed ${source} network-transition error: ${error instanceof Error ? error.message : String(error)}`
+    )
+
+    try {
+      sendPowerResume()
+    } catch {
+      // best-effort reconnect kick
+    }
+  },
+  showFatalError: error => {
+    const stack = describeCrashReason(error)
+
+    try {
+      dialog.showErrorBox('A JavaScript error occurred in the main process', `Uncaught Exception:\n${stack}`)
+    } catch {
+      console.error(error)
+    }
+  }
+})
 
 // A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
 // the user can send us. `label` names the surface so the log says which one.
@@ -5126,7 +5194,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 
   if (probeAuth.kind === 'cookie') {
     return {
-      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSessionWithRetry(url, options),
       probeIsCredentialed: true
     }
   }
@@ -6137,49 +6205,120 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // JSON request routed through the OAuth session partition so the HttpOnly
 // session cookie is attached automatically by Electron's net stack. Used for
 // authed REST against a gated gateway, including minting WS tickets.
-function fetchJsonViaOauthSession(url, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const sess = getOauthSession()
+type OauthSessionRequestOptions = {
+  method?: string
+  body?: unknown
+  timeoutMs?: number
+}
 
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
+type PromiseWithResolversConstructor = {
+  withResolvers<T>(): {
+    promise: Promise<T>
+    resolve: (value: T | PromiseLike<T>) => void
+    reject: (reason?: unknown) => void
+  }
+}
 
-      return
-    }
+// Electron 40 provides this at runtime; the desktop compiler still declares
+// only the ES2023 library, so describe the newer constructor method locally.
+const promiseWithResolversConstructor = Promise as unknown as PromiseWithResolversConstructor
 
-    let parsed
+function fetchJsonViaOauthSession(url: string, options: OauthSessionRequestOptions = {}) {
+  const { promise, resolve, reject } = promiseWithResolversConstructor.withResolvers<unknown>()
+  const sess = getOauthSession()
 
-    try {
-      parsed = new URL(url)
-    } catch (error) {
-      reject(new Error(`Invalid URL: ${error.message}`))
+  if (!sess) {
+    reject(new Error('OAuth session partition is unavailable.'))
 
-      return
-    }
+    return promise
+  }
 
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+  let parsed: URL
 
-      return
-    }
+  try {
+    parsed = new URL(url)
+  } catch (error) {
+    reject(new Error(`Invalid URL: ${error instanceof Error ? error.message : String(error)}`))
 
-    const body = serializeJsonBody(options.body)
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    return promise
+  }
 
-    const request = electronNet.request({
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+    return promise
+  }
+
+  let body: Buffer | undefined
+
+  try {
+    body = serializeJsonBody(options.body)
+  } catch (error) {
+    reject(error)
+
+    return promise
+  }
+
+  const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  let request: ClientRequest
+
+  try {
+    request = electronNet.request({
       method: options.method || 'GET',
       url,
       session: sess,
       useSessionCookies: true,
       redirect: 'follow'
-    } as any)
+    })
+  } catch (error) {
+    rememberLog(
+      `[net] electronNet.request threw synchronously: ${error instanceof Error ? error.message : String(error)}`
+    )
+    reject(error instanceof Error ? error : new Error(`Network request could not start: ${String(error)}`))
 
+    return promise
+  }
+
+  let settled = false
+  let timer: NodeJS.Timeout | null = null
+
+  const cleanup = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+
+  const settleReject = (error: unknown) => {
+    if (settled) {
+      return
+    }
+
+    settled = true
+    cleanup()
+    reject(error)
+  }
+
+  const settleResolve = (value: unknown) => {
+    if (settled) {
+      return
+    }
+
+    settled = true
+    cleanup()
+    resolve(value)
+  }
+
+  try {
     setJsonRequestHeaders(request)
 
-    let timedOut = false
+    timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
 
-    const timer = setTimeout(() => {
-      timedOut = true
+      settled = true
+      timer = null
 
       try {
         request.abort()
@@ -6191,27 +6330,28 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     }, timeoutMs)
 
     request.on('response', res => {
-      const chunks = []
+      const chunks: Buffer[] = []
+      // Mid-body network transitions deliver the failure on the response
+      // stream, not the request. Without this listener Node throws an
+      // uncaughtException from SimpleURLLoaderWrapper.
+      res.on('error', settleReject)
       res.on('data', chunk => chunks.push(Buffer.from(chunk)))
       res.on('end', () => {
-        if (timedOut) {
+        if (settled) {
           return
         }
 
-        clearTimeout(timer)
         const text = Buffer.concat(chunks).toString('utf8')
         const statusCode = res.statusCode || 500
 
         if (statusCode >= 400) {
-          const err = new Error(`${statusCode}: ${text || ''}`) as any
-          err.statusCode = statusCode
-          reject(err)
+          settleReject(Object.assign(new Error(`${statusCode}: ${text || ''}`), { statusCode }))
 
           return
         }
 
         if (!text) {
-          resolve(null)
+          settleResolve(null)
 
           return
         }
@@ -6220,32 +6360,46 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         const contentType = String(res.headers['content-type'] || res.headers['Content-Type'] || '')
 
         if (looksHtml || contentType.includes('text/html')) {
-          reject(new Error(`Expected JSON from ${url} but got HTML (status ${statusCode}).`))
+          settleReject(new Error(`Expected JSON from ${url} but got HTML (status ${statusCode}).`))
 
           return
         }
 
         try {
-          resolve(JSON.parse(text))
+          settleResolve(JSON.parse(text))
         } catch {
-          reject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
+          settleReject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
         }
       })
     })
-    request.on('error', error => {
-      if (timedOut) {
-        return
-      }
-
-      clearTimeout(timer)
-      reject(error)
-    })
+    request.on('error', settleReject)
 
     if (body) {
       request.write(body)
     }
 
     request.end()
+  } catch (error) {
+    settleReject(error)
+  }
+
+  return promise
+}
+
+// OAuth JSON with a short retry budget for interface transitions
+// (Ethernet↔Wi-Fi, sleep/wake). Callers still see a normal rejection if the
+// network never stabilizes — we never crash the main process for this class.
+async function fetchJsonViaOauthSessionWithRetry(url: string, options: OauthSessionRequestOptions = {}) {
+  return withTransientNetworkRetry(() => fetchJsonViaOauthSession(url, options), {
+    retries: 2,
+    delayMs: 350,
+    onRetry: (error, attempt) => {
+      rememberLog(
+        `[net] retrying OAuth session request after network transition (attempt ${attempt}): ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
   })
 }
 
@@ -6406,7 +6560,7 @@ async function mintGatewayWsTicket(baseUrl) {
     return ticket
   }
 
-  const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
+  const body = (await fetchJsonViaOauthSessionWithRetry(`${baseUrl}/api/auth/ws-ticket`, {
     method: 'POST',
     timeoutMs: 8_000
   })) as any
@@ -6628,7 +6782,7 @@ async function discoverCloudAgents(org?: string) {
   let body
 
   try {
-    body = (await fetchJsonViaOauthSession(`${portalBaseUrl}/api/agents${orgQuery}`, {
+    body = (await fetchJsonViaOauthSessionWithRetry(`${portalBaseUrl}/api/agents${orgQuery}`, {
       method: 'GET',
       timeoutMs: 15_000
     })) as any
@@ -7655,7 +7809,7 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
       return fetchJson(url, null, { ...opts, bearer: nativeAt })
     }
 
-    return fetchJsonViaOauthSession(url, opts)
+    return fetchJsonViaOauthSessionWithRetry(url, opts)
   }
 
   return fetchJson(url, conn.token, opts)
@@ -10281,7 +10435,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
       })
     }
 
-    return fetchJsonViaOauthSession(url, {
+    return fetchJsonViaOauthSessionWithRetry(url, {
       method: request?.method,
       body: request?.body,
       timeoutMs
